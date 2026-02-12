@@ -19,6 +19,7 @@ metadata:
 - Output the call graph in a format that can be visualized with a graph visualization tool, such as Graphviz or Mermaid
     - For Graphviz, output the call graph in DOT format
     - For Mermaid, output the call graph in Mermaid syntax
+- If there are circular dependencies between targets, report those circular dependencies
 
 ## When to use me
 
