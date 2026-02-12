@@ -18,8 +18,9 @@ metadata:
     - If the result of the dry-run of the target is non-zero, report that result as a failure
     - If the result of the dry-run of the target is zero, report that result as a success
 - For the targets that only affect the user's host, run each target
-    - If the result of the dry-run of the target is non-zero, report that result as a failure
-    - If the result of the dry-run of the target is zero, report that result as a success
+    - If the result of the target is non-zero, report that result as a failure
+    - If the result of the target is zero, report that result as a success
+    - If there are targets that build docker images, ask how long the user would like to wait for the docker build to complete and use that as a timeout for any make targets that invoke a docker build
 - When a target fails, continue testing the remaining targets
 
 ## When to use me
