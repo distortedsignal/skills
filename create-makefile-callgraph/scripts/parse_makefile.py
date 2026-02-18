@@ -327,6 +327,8 @@ def parse_args():
     parser.add_argument('--phony-only', '-p',
                         action='store_true',
                         help="Only show PHONY targets (ignores file targets)")
+    parser.add_argument('--no-src', action='store_true',
+                        help="Do not show source file dependencies (only targets and their relationships)")
     return parser.parse_args()
 
 def main():
@@ -345,6 +347,11 @@ def main():
         
         filtered_make_calls = {k: v for k, v in make_calls.items() if k in phony_targets}
         make_calls = filtered_make_calls
+    
+    # Filter out source file dependencies if requested
+    if arg_ns.no_src:
+        for target in targets:
+            targets[target] = [d for d in targets[target] if not re.match(r'src.*$', d)]
     
     # Build complete graph for cycle detection
     graph = {}
