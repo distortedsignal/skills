@@ -11,7 +11,7 @@ metadata:
 
 - Start at the current directory and search through all subdirectories for Makefiles
     - `find . -name "Makefile" -type "f"`
-- The script in `scripts/parse_makefile.py` will parse each Makefile and...
+- The script in `$skill_dir/create-makefile-callgraph/scripts/parse_makefile.py` will parse each Makefile and...
     - Make a list of the targets in each makefile
     - Make a call graph of the targets in each makefile
         - If a target calls another target, draw an edge from the calling target to the called target
