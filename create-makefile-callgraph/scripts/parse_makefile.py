@@ -3,8 +3,12 @@
 
 import argparse
 from enum import StrEnum
+import os
 import re
+import subprocess
+import sys
 from collections import defaultdict
+from pathlib import Path
 
 class OutputFormat(StrEnum):
     DOT = 'dot'
@@ -12,49 +16,213 @@ class OutputFormat(StrEnum):
     BOTH = 'both'
     SUMMARY = 'summary'
 
-def parse_makefile(filepath):
-    """Parse a Makefile and extract targets with their dependencies."""
+def parse_makefile_with_make(makefile_path):
+    """
+    Parse a Makefile using 'make -pn' to get the expanded database.
+    This handles variable expansion, implicit rules, and complex makefiles accurately.
+    """
+    makefile_path = Path(makefile_path).resolve()
+    makefile_dir = makefile_path.parent
+    makefile_name = makefile_path.name
+    
+    # Run make -pn to get the database
+    # -p: print database
+    # -n: dry run (don't execute)
+    # -f: specify makefile
+    try:
+        cmd = ['make', '-pn', '-f', str(makefile_path)]
+        result = subprocess.run(
+            cmd,
+            cwd=makefile_dir,
+            capture_output=True,
+            text=True,
+            timeout=30
+        )
+        output = result.stdout
+    except subprocess.TimeoutExpired:
+        print(f"Error: make -pn timed out after 30 seconds", file=sys.stderr)
+        sys.exit(1)
+    except subprocess.CalledProcessError as e:
+        print(f"Error running make -pn: {e}", file=sys.stderr)
+        print(f"stdout: {e.stdout}", file=sys.stderr)
+        print(f"stderr: {e.stderr}", file=sys.stderr)
+        sys.exit(1)
+    except FileNotFoundError:
+        print("Error: 'make' command not found. Please ensure GNU Make is installed.", file=sys.stderr)
+        sys.exit(1)
+    
+    return parse_make_database(output, makefile_dir)
+
+def parse_make_database(make_output, makefile_dir):
+    """
+    Parse the output of 'make -pn' to extract targets and dependencies.
+    """
     targets = {}
-    
-    with open(filepath, 'r') as f:
-        content = f.read()
-    
-    # Pattern to match target definitions: target: dependencies
-    # This handles both phony and file targets
-    target_pattern = r'^([a-zA-Z0-9_/.@-]+):\s*([^\n]*?)(?:\s*##.*)?$'
-    
-    for match in re.finditer(target_pattern, content, re.MULTILINE):
-        target = match.group(1)
-        deps_str = match.group(2).strip()
-        
-        # Parse dependencies (space-separated)
-        deps = [d.strip() for d in deps_str.split() if d.strip()]
-        
-        targets[target] = deps
-    
-    # Also look for $(MAKE) calls within target recipes
     make_calls = defaultdict(list)
+    phony_targets = set()
+    
+    # Common make internal variables and targets to skip
+    SKIP_TARGETS = {
+        '.DEFAULT', '.SUFFIXES', '.INTERMEDIATE', '.SECONDARY', 
+        '.PRECIOUS', '.IGNORE', '.SILENT', '.EXPORT_ALL_VARIABLES',
+        '.NOTPARALLEL', '.ONESHELL', '.POSIX', 'Makefile',
+        'GNUmakefile', 'makefile'
+    }
+    
+    # Common make variables to skip
+    SKIP_VARS = {
+        'MAKEFILES', 'MAKEFILE_LIST', 'CURDIR', 'SHELL', 'MAKE',
+        'MAKELEVEL', 'MAKEFLAGS', 'MFLAGS', 'MAKE_VERSION',
+        'MAKE_COMMAND', '.DEFAULT_GOAL', '.VARIABLES', '.FEATURES',
+        'VPATH', '.INCLUDE_DIRS', '.RECIPEPREFIX', 'MAKECMDGOALS'
+    }
+    
+    lines = make_output.split('\n')
+    i = 0
     current_target = None
+    current_recipe = []
+    in_database_section = False
     
-    for line in content.split('\n'):
-        # Check if this is a target line
-        if re.match(r'^[a-zA-Z0-9_/.@-]+:', line):
-            match = re.match(r'^([a-zA-Z0-9_/.@-]+):', line)
-            if match:
-                current_target = match.group(1)
-        # Check for $(MAKE) calls in recipe lines (must start with tab)
-        elif line.startswith('\t') and current_target:
-            # Look for $(MAKE) target or $(MAKE) -C dir target
-            make_match = re.search(r'\$\(MAKE\)(?:\s+-C\s+([^\s]+))?\s+([a-zA-Z0-9_/-]+)', line)
-            if make_match:
-                subdir = make_match.group(1)
-                subtarget = make_match.group(2)
-                if subdir:
-                    make_calls[current_target].append(f"{subdir}/{subtarget}")
+    while i < len(lines):
+        line = lines[i]
+        
+        # Detect when we enter the database section
+        if line.startswith('# Files'):
+            in_database_section = True
+            i += 1
+            continue
+        
+        # Skip lines before database section
+        if not in_database_section:
+            # Still look for .PHONY declarations in the early output
+            if '.PHONY:' in line or line.startswith('.PHONY'):
+                phony_match = re.search(r'\.PHONY:\s*(.+)', line)
+                if phony_match:
+                    phony_list = phony_match.group(1).strip().split()
+                    phony_targets.update(phony_list)
+            i += 1
+            continue
+        
+        # Skip comment lines and empty lines in database section
+        if line.startswith('#') or not line.strip():
+            i += 1
+            continue
+        
+        # Look for .PHONY declarations
+        if '.PHONY:' in line or line.startswith('.PHONY'):
+            phony_match = re.search(r'\.PHONY:\s*(.+)', line)
+            if phony_match:
+                phony_list = phony_match.group(1).strip().split()
+                phony_targets.update(phony_list)
+            i += 1
+            continue
+        
+        # Match target lines: "target: dependencies"
+        target_match = re.match(r'^([^#:\s][^:]*?):\s*(.*)$', line)
+        
+        if target_match:
+            target = target_match.group(1).strip()
+            deps_str = target_match.group(2).strip()
+            
+            # Skip if it's a variable assignment (contains =)
+            if '=' in line and ':' in line:
+                # Check if = comes before :
+                eq_pos = line.index('=')
+                colon_pos = line.index(':')
+                if eq_pos < colon_pos:
+                    i += 1
+                    continue
+            
+            # Skip internal make targets
+            if target in SKIP_TARGETS:
+                i += 1
+                continue
+            
+            # Skip internal make variables
+            if target in SKIP_VARS:
+                i += 1
+                continue
+            
+            # Skip targets that look like variable assignments
+            if target.isupper() and ' ' not in target:
+                # Likely a variable like BLUE, GREEN, etc.
+                i += 1
+                continue
+            
+            # Skip targets that contain absolute paths from the make database
+            if target.startswith('/'):
+                i += 1
+                continue
+            
+            # Skip pattern rules
+            if '%' in target:
+                i += 1
+                continue
+            
+            # Skip internal targets (start with .)
+            if target.startswith('.') and target not in ['.PHONY']:
+                i += 1
+                continue
+            
+            # Parse dependencies
+            deps = []
+            if deps_str:
+                # Remove comments from dependency line
+                deps_str = re.sub(r'#.*$', '', deps_str).strip()
+                # Split on whitespace
+                deps = [d.strip() for d in deps_str.split() if d.strip()]
+            
+            # Store target and dependencies
+            if target not in targets:
+                targets[target] = []
+            targets[target].extend(deps)
+            
+            current_target = target
+            current_recipe = []
+            
+            # Look ahead for recipe lines (start with # in dry-run output)
+            j = i + 1
+            while j < len(lines):
+                next_line = lines[j]
+                # Recipe lines in make -pn output start with #
+                if next_line.startswith('#'):
+                    recipe_line = next_line[1:].strip()
+                    current_recipe.append(recipe_line)
+                    j += 1
+                elif next_line.strip() == '':
+                    j += 1
                 else:
-                    make_calls[current_target].append(subtarget)
+                    break
+            
+            # Parse recipe for $(MAKE) calls
+            for recipe_line in current_recipe:
+                # Look for $(MAKE) or ${MAKE} calls
+                make_match = re.search(r'\$[\({]MAKE[\)}](?:\s+-C\s+([^\s]+))?\s+([a-zA-Z0-9_/-]+)', recipe_line)
+                if make_match:
+                    subdir = make_match.group(1)
+                    subtarget = make_match.group(2)
+                    if subdir:
+                        make_calls[current_target].append(f"{subdir}/{subtarget}")
+                    else:
+                        make_calls[current_target].append(subtarget)
+            
+            i = j
+        else:
+            i += 1
     
-    return targets, make_calls
+    # Remove duplicates from dependencies
+    for target in targets:
+        targets[target] = list(dict.fromkeys(targets[target]))
+    
+    return targets, make_calls, phony_targets
+
+def parse_makefile(filepath):
+    """
+    Parse a Makefile and extract targets with their dependencies.
+    This is the main entry point that uses make -pn for accurate parsing.
+    """
+    targets, make_calls, phony_targets = parse_makefile_with_make(filepath)
+    return targets, make_calls, phony_targets
 
 def find_cycles(graph):
     """Find all cycles in the dependency graph using DFS."""
@@ -156,13 +324,27 @@ def parse_args():
                         default=OutputFormat.BOTH.value,
                         help=f"Output format (default: {OutputFormat.BOTH.value})\n"+
                         "NOTE: 'summary' will only print the analysis summary without graph outputs")
+    parser.add_argument('--phony-only', '-p',
+                        action='store_true',
+                        help="Only show PHONY targets (ignores file targets)")
     return parser.parse_args()
 
 def main():
     arg_ns = parse_args()
     makefile_path = arg_ns.makefile_path
     
-    targets, make_calls = parse_makefile(makefile_path)
+    targets, make_calls, phony_targets = parse_makefile(makefile_path)
+    
+    # Filter to only phony targets if requested
+    if arg_ns.phony_only:
+        filtered_targets = {k: v for k, v in targets.items() if k in phony_targets}
+        # Also filter dependencies to only include phony targets
+        for target in filtered_targets:
+            filtered_targets[target] = [d for d in filtered_targets[target] if d in phony_targets]
+        targets = filtered_targets
+        
+        filtered_make_calls = {k: v for k, v in make_calls.items() if k in phony_targets}
+        make_calls = filtered_make_calls
     
     # Build complete graph for cycle detection
     graph = {}
@@ -183,15 +365,19 @@ def main():
     
     print(f"Makefile: {makefile_path}")
     print(f"Total targets: {len(targets)}")
+    print(f"Phony targets: {len(phony_targets)}")
+    if arg_ns.phony_only:
+        print("(Showing PHONY targets only)")
     print()
     
     print("TARGETS AND DEPENDENCIES:")
     print("-" * 80)
     for target, deps in sorted(targets.items()):
+        phony_marker = " [PHONY]" if target in phony_targets else ""
         if deps:
-            print(f"{target}: {' '.join(deps)}")
+            print(f"{target}{phony_marker}: {' '.join(deps)}")
         else:
-            print(f"{target}: (no dependencies)")
+            print(f"{target}{phony_marker}: (no dependencies)")
     print()
     
     if make_calls:
